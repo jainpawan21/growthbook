@@ -7,6 +7,7 @@ import {
 import { getNextScheduledUpdate } from "../services/features";
 import { getOrganizationById } from "../services/organizations";
 import { logger } from "../util/logger";
+import { trackJob } from "../services/otel";
 
 type UpdateSingleFeatureJob = Job<{
   featureId: string;
@@ -42,20 +43,23 @@ async function queueFeatureUpdate(
 }
 
 export default async function (agenda: Agenda) {
-  agenda.define(QUEUE_FEATURE_UPDATES, async () => {
-    const featureIds = (await getScheduledFeaturesToUpdate()).map((f) => {
-      return { id: f.id, organization: f.organization };
-    });
+  agenda.define(
+    QUEUE_FEATURE_UPDATES,
+    trackJob(QUEUE_FEATURE_UPDATES, async () => {
+      const featureIds = (await getScheduledFeaturesToUpdate()).map((f) => {
+        return { id: f.id, organization: f.organization };
+      });
 
-    for (let i = 0; i < featureIds.length; i++) {
-      await queueFeatureUpdate(agenda, featureIds[i]);
-    }
-  });
+      for (let i = 0; i < featureIds.length; i++) {
+        await queueFeatureUpdate(agenda, featureIds[i]);
+      }
+    })
+  );
 
   agenda.define(
     UPDATE_SINGLE_FEATURE,
     { lockLifetime: 30 * 60 * 1000 },
-    updateSingleFeature
+    trackJob(UPDATE_SINGLE_FEATURE, updateSingleFeature)
   );
 
   await fireUpdateWebhook(agenda);

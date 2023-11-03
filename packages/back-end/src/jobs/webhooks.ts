@@ -7,6 +7,7 @@ import { getFeatureDefinitions } from "../services/features";
 import { WebhookInterface } from "../../types/webhook";
 import { CRON_ENABLED } from "../util/secrets";
 import { SDKPayloadKey } from "../../types/sdk-payload";
+import { trackJob } from "../services/otel";
 
 const WEBHOOK_JOB_NAME = "fireWebhook";
 type WebhookJob = Job<{
@@ -19,65 +20,70 @@ export default function (ag: Agenda) {
   agenda = ag;
 
   // Fire webhooks
-  agenda.define(WEBHOOK_JOB_NAME, async (job: WebhookJob) => {
-    const webhookId = job.attrs.data?.webhookId;
-    if (!webhookId) return;
+  agenda.define(
+    WEBHOOK_JOB_NAME,
+    trackJob(WEBHOOK_JOB_NAME, async (job: WebhookJob) => {
+      const webhookId = job.attrs.data?.webhookId;
+      if (!webhookId) return;
 
-    const webhook = await WebhookModel.findOne({
-      id: webhookId,
-    });
+      const webhook = await WebhookModel.findOne({
+        id: webhookId,
+      });
 
-    if (!webhook) return;
+      if (!webhook) return;
 
-    const { features, dateUpdated } = await getFeatureDefinitions({
-      organization: webhook.organization,
-      environment:
-        webhook.environment === undefined ? "production" : webhook.environment,
-      project: webhook.project || "",
-    });
+      const { features, dateUpdated } = await getFeatureDefinitions({
+        organization: webhook.organization,
+        environment:
+          webhook.environment === undefined
+            ? "production"
+            : webhook.environment,
+        project: webhook.project || "",
+      });
 
-    // eslint-disable-next-line
-    const body: any = {
-      timestamp: Math.floor(Date.now() / 1000),
-      features,
-      dateUpdated,
-    };
+      // eslint-disable-next-line
+      const body: any = {
+        timestamp: Math.floor(Date.now() / 1000),
+        features,
+        dateUpdated,
+      };
 
-    if (!webhook.featuresOnly) {
-      const { overrides, expIdMapping } = await getExperimentOverrides(
-        webhook.organization,
-        webhook.project
-      );
-      body.overrides = overrides;
-      body.experiments = expIdMapping;
-    }
+      if (!webhook.featuresOnly) {
+        const { overrides, expIdMapping } = await getExperimentOverrides(
+          webhook.organization,
+          webhook.project
+        );
+        body.overrides = overrides;
+        body.experiments = expIdMapping;
+      }
 
-    const payload = JSON.stringify(body);
+      const payload = JSON.stringify(body);
 
-    const signature = createHmac("sha256", webhook.signingKey)
-      .update(payload)
-      .digest("hex");
+      const signature = createHmac("sha256", webhook.signingKey)
+        .update(payload)
+        .digest("hex");
 
-    const res = await fetch(webhook.endpoint, {
-      headers: {
-        "Content-Type": "application/json",
-        "X-GrowthBook-Signature": signature,
-      },
-      method: "POST",
-      body: payload,
-    });
+      const res = await fetch(webhook.endpoint, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-GrowthBook-Signature": signature,
+        },
+        method: "POST",
+        body: payload,
+      });
 
-    if (!res.ok) {
-      const e = "POST returned an invalid status code: " + res.status;
-      webhook.set("error", e);
+      if (!res.ok) {
+        const e = "POST returned an invalid status code: " + res.status;
+        webhook.set("error", e);
+        await webhook.save();
+        throw new Error(e);
+      }
+
+      webhook.set("error", "");
+      webhook.set("lastSuccess", new Date());
       await webhook.save();
-      throw new Error(e);
-    }
-
-    webhook.set("error", "");
-    webhook.set("lastSuccess", new Date());
-    await webhook.save();
-  });
+    })
+  );
   agenda.on(
     "fail:" + WEBHOOK_JOB_NAME,
     async (error: Error, job: WebhookJob) => {

@@ -27,7 +27,7 @@ import { ExperimentSnapshotInterface } from "../../types/experiment-snapshot";
 import { findProjectById } from "../models/ProjectModel";
 import { getExperimentWatchers } from "../models/WatchModel";
 import { getFactTableMap } from "../models/FactTableModel";
-import { getUpDownCounter } from "../services/otel";
+import { trackJob } from "../services/otel";
 
 // Time between experiment result updates (default 6 hours)
 const UPDATE_EVERY = EXPERIMENT_REFRESH_FREQUENCY * 60 * 60 * 1000;
@@ -40,38 +40,31 @@ type UpdateSingleExpJob = Job<{
   experimentId: string;
 }>;
 
-const counter = getUpDownCounter("update_experiment_results");
-
 export default async function (agenda: Agenda) {
-  agenda.define(QUEUE_EXPERIMENT_UPDATES, async () => {
-    // Old way of queuing experiments based on a fixed schedule
-    // Will remove in the future when it's no longer needed
-    const ids = await legacyQueueExperimentUpdates();
+  agenda.define(
+    QUEUE_EXPERIMENT_UPDATES,
+    trackJob(QUEUE_EXPERIMENT_UPDATES, async () => {
+      // Old way of queuing experiments based on a fixed schedule
+      // Will remove in the future when it's no longer needed
+      const ids = await legacyQueueExperimentUpdates();
 
-    // New way, based on dynamic schedules
-    const experiments = await getExperimentsToUpdate(ids);
+      // New way, based on dynamic schedules
+      const experiments = await getExperimentsToUpdate(ids);
 
-    for (let i = 0; i < experiments.length; i++) {
-      await queueExperimentUpdate(
-        experiments[i].organization,
-        experiments[i].id
-      );
-    }
-  });
+      for (let i = 0; i < experiments.length; i++) {
+        await queueExperimentUpdate(
+          experiments[i].organization,
+          experiments[i].id
+        );
+      }
+    })
+  );
 
   agenda.define(
     UPDATE_SINGLE_EXP,
     // This job queries a datasource, which may be slow. Give it 30 minutes to complete.
     { lockLifetime: 30 * 60 * 1000 },
-    (job: UpdateSingleExpJob) => {
-      try {
-        counter.add(1);
-        updateSingleExperiment(job);
-        counter.add(-1);
-      } catch (e) {
-        counter.add(-1);
-      }
-    }
+    trackJob(UPDATE_SINGLE_EXP, updateSingleExperiment)
   );
 
   // Update experiment results

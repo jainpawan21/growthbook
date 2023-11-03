@@ -11,6 +11,7 @@ import {
 import { SDKConnectionInterface } from "../../types/sdk-connection";
 import { cancellableFetch } from "../util/http.util";
 import { logger } from "../util/logger";
+import { trackJob } from "../services/otel";
 
 const PROXY_UPDATE_JOB_NAME = "proxyUpdate";
 type ProxyUpdateJob = Job<{
@@ -24,67 +25,70 @@ export default function addProxyUpdateJob(ag: Agenda) {
   agenda = ag;
 
   // Fire webhooks
-  agenda.define(PROXY_UPDATE_JOB_NAME, async (job: ProxyUpdateJob) => {
-    const connectionId = job.attrs.data?.connectionId;
-    const useCloudProxy = job.attrs.data?.useCloudProxy;
-    if (!connectionId) {
-      logger.error(
-        "proxyUpdate: No connectionId provided for proxy update job",
-        { connectionId, useCloudProxy }
-      );
-      return;
-    }
+  agenda.define(
+    PROXY_UPDATE_JOB_NAME,
+    trackJob(PROXY_UPDATE_JOB_NAME, async (job: ProxyUpdateJob) => {
+      const connectionId = job.attrs.data?.connectionId;
+      const useCloudProxy = job.attrs.data?.useCloudProxy;
+      if (!connectionId) {
+        logger.error(
+          "proxyUpdate: No connectionId provided for proxy update job",
+          { connectionId, useCloudProxy }
+        );
+        return;
+      }
 
-    const connection = await findSDKConnectionById(connectionId);
-    if (!connection) {
-      logger.error("proxyUpdate: Could not find sdk connection", {
-        connectionId,
-        useCloudProxy,
+      const connection = await findSDKConnectionById(connectionId);
+      if (!connection) {
+        logger.error("proxyUpdate: Could not find sdk connection", {
+          connectionId,
+          useCloudProxy,
+        });
+        return;
+      }
+
+      // TODO This probably needs to renamed
+      const defs = await getFeatureDefinitions({
+        organization: connection.organization,
+        environment: connection.environment,
+        project: connection.project,
+        encryptionKey: connection.encryptPayload
+          ? connection.encryptionKey
+          : undefined,
+
+        includeVisualExperiments: connection.includeVisualExperiments,
+        includeDraftExperiments: connection.includeDraftExperiments,
+        includeExperimentNames: connection.includeExperimentNames,
+        hashSecureAttributes: connection.hashSecureAttributes,
       });
-      return;
-    }
 
-    // TODO This probably needs to renamed
-    const defs = await getFeatureDefinitions({
-      organization: connection.organization,
-      environment: connection.environment,
-      project: connection.project,
-      encryptionKey: connection.encryptPayload
-        ? connection.encryptionKey
-        : undefined,
+      const payload = JSON.stringify(defs);
 
-      includeVisualExperiments: connection.includeVisualExperiments,
-      includeDraftExperiments: connection.includeDraftExperiments,
-      includeExperimentNames: connection.includeExperimentNames,
-      hashSecureAttributes: connection.hashSecureAttributes,
-    });
+      // note: Cloud users will typically have proxy.enabled === false (unless using a local proxy), but will still have a valid proxy.signingKey
+      const signature = createHmac("sha256", connection.proxy.signingKey)
+        .update(payload)
+        .digest("hex");
 
-    const payload = JSON.stringify(defs);
+      const url = useCloudProxy
+        ? `https://proxy.growthbook.io/proxy/features`
+        : `${connection.proxy.host}/proxy/features`;
 
-    // note: Cloud users will typically have proxy.enabled === false (unless using a local proxy), but will still have a valid proxy.signingKey
-    const signature = createHmac("sha256", connection.proxy.signingKey)
-      .update(payload)
-      .digest("hex");
+      const res = await fireProxyWebhook({
+        url,
+        signature,
+        key: connection.key,
+        payload,
+      });
 
-    const url = useCloudProxy
-      ? `https://proxy.growthbook.io/proxy/features`
-      : `${connection.proxy.host}/proxy/features`;
+      if (!res.ok) {
+        const e = "POST returned an invalid status code: " + res.status;
+        await setProxyError(connection, e);
+        throw new Error(e);
+      }
 
-    const res = await fireProxyWebhook({
-      url,
-      signature,
-      key: connection.key,
-      payload,
-    });
-
-    if (!res.ok) {
-      const e = "POST returned an invalid status code: " + res.status;
-      await setProxyError(connection, e);
-      throw new Error(e);
-    }
-
-    await setProxyError(connection, "");
-  });
+      await setProxyError(connection, "");
+    })
+  );
   agenda.on(
     "fail:" + PROXY_UPDATE_JOB_NAME,
     async (error: Error, job: ProxyUpdateJob) => {
