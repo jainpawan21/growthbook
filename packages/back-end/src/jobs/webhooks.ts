@@ -22,6 +22,7 @@ export default function (ag: Agenda) {
   // Fire webhooks
   agenda.define(
     WEBHOOK_JOB_NAME,
+
     trackJob(WEBHOOK_JOB_NAME, async (job: WebhookJob) => {
       const webhookId = job.attrs.data?.webhookId;
       if (!webhookId) return;
@@ -38,7 +39,7 @@ export default function (ag: Agenda) {
           webhook.environment === undefined
             ? "production"
             : webhook.environment,
-        project: webhook.project || "",
+        projects: webhook.project ? [webhook.project] : [],
       });
 
       // eslint-disable-next-line
